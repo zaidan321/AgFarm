@@ -1,0 +1,93 @@
+# =============================================================================
+# docker-compose.yaml — AgFarm Docker Compose
+#
+# Services:
+#   app   — Laravel PHP-FPM (port 9000, internal)
+#   nginx — Nginx web server (port 8080 host → 80 internal)
+#   db    — MariaDB 11.8 (port 3306, internal only)
+#
+# Variabel yang harus tersedia saat menjalankan docker compose:
+#   GHCR_USERNAME  — GitHub username/org pemilik package (lowercase)
+#   IMAGE_TAG      — Tag image yang akan dijalankan (contoh: sha-a1b2c3d)
+#   DB_DATABASE    — Nama database MariaDB
+#   DB_USERNAME    — User database MariaDB
+#   DB_PASSWORD    — Password user database
+#   DB_ROOT_PASSWORD — Password root MariaDB
+#
+# Variabel di atas dibaca dari file .env di direktori yang sama dengan
+# compose.yaml ini. Pada deployment otomatis, CI/CD meng-override
+# GHCR_USERNAME dan IMAGE_TAG melalui environment job.
+# =============================================================================
+
+name: agfarm
+
+services:
+    # ─────────────────────────────────────────────────────────────────────────
+    # app — Laravel PHP-FPM
+    # ─────────────────────────────────────────────────────────────────────────
+    app:
+        image: ghcr.io/${GHCR_USERNAME:?GHCR_USERNAME belum diatur}/agfarm-app:${IMAGE_TAG:?IMAGE_TAG belum diatur}
+        container_name: agfarm-app
+        env_file:
+            - /opt/agfarm/app.env
+        networks:
+            - internal
+        depends_on:
+            db:
+                condition: service_healthy
+        restart: unless-stopped
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # nginx — Nginx web server
+    # Port 8080 pada host hanya mendengarkan koneksi loopback (127.0.0.1).
+    # ─────────────────────────────────────────────────────────────────────────
+    nginx:
+        image: ghcr.io/${GHCR_USERNAME:?GHCR_USERNAME belum diatur}/agfarm-web:${IMAGE_TAG:?IMAGE_TAG belum diatur}
+        container_name: agfarm-nginx
+        ports:
+            - "127.0.0.1:8080:80"
+        networks:
+            - internal
+        depends_on:
+            - app
+        restart: unless-stopped
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # db — MariaDB 11.8
+    # Tidak diekspos ke luar host. Laravel mengakses via nama service "db".
+    # Data persisten disimpan di named volume agfarm_db_data.
+    # ─────────────────────────────────────────────────────────────────────────
+    db:
+        image: mariadb:11.8
+        container_name: agfarm-db
+        environment:
+            MARIADB_DATABASE: ${DB_DATABASE:?DB_DATABASE belum diatur}
+            MARIADB_USER: ${DB_USERNAME:?DB_USERNAME belum diatur}
+            MARIADB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD belum diatur}
+            MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD belum diatur}
+        volumes:
+            - agfarm_db_data:/var/lib/mysql
+        networks:
+            - internal
+        healthcheck:
+            test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 30s
+        restart: unless-stopped
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Networks
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+    internal:
+        driver: bridge
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volumes
+# Named volume untuk data MariaDB — JANGAN dihapus saat deployment normal.
+# Jangan gunakan: docker compose down -v
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+    agfarm_db_data:

@@ -1,0 +1,210 @@
+name: AgFarm CI/CD
+
+# Trigger: push ke branch main, atau manual melalui workflow_dispatch.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # ===========================================================================
+  # CI — Validasi aplikasi, build Docker image, dan push ke GHCR
+  # Runner: GitHub-hosted
+  # ===========================================================================
+  ci:
+    name: CI — Build & Push
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Setup PHP untuk validasi dependency Composer
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: pdo_mysql, mbstring, bcmath, zip, intl, opcache, dom, xml, curl, fileinfo, ctype, tokenizer
+          coverage: none
+
+      # 3. Validasi dan install Composer dependencies
+      - name: Validate Composer files
+        run: composer validate --strict
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      # 4. Verifikasi kebutuhan platform PHP
+      - name: Verify PHP platform requirements
+        run: composer check-platform-reqs
+
+      # 5. Buat tag image berdasarkan 12 karakter commit SHA.
+      # Tag yang sama dipakai untuk image app dan nginx.
+      - name: Set image tag dan registry variables
+        id: vars
+        shell: bash
+        run: |
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_TAG="sha-${GITHUB_SHA:0:12}"
+          echo "GHCR_OWNER=${OWNER}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      # 6. Login ke GHCR menggunakan GITHUB_TOKEN.
+      # Package Private harus memberikan akses kepada repository workflow ini.
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 7. Build image. Dockerfile menangani build asset Vite di node-builder.
+      - name: Build App image (target php-app)
+        run: |
+          docker build \
+            --target php-app \
+            --tag ghcr.io/${GHCR_OWNER}/agfarm-app:${IMAGE_TAG} \
+            .
+
+      - name: Build Nginx image (target nginx-web)
+        run: |
+          docker build \
+            --target nginx-web \
+            --tag ghcr.io/${GHCR_OWNER}/agfarm-web:${IMAGE_TAG} \
+            .
+
+      # 8. Push image dengan tag immutable berbasis commit SHA.
+      - name: Push images ke GHCR
+        run: |
+          docker push ghcr.io/${GHCR_OWNER}/agfarm-app:${IMAGE_TAG}
+          docker push ghcr.io/${GHCR_OWNER}/agfarm-web:${IMAGE_TAG}
+
+  # ===========================================================================
+  # CD — Deploy ke VPS melalui self-hosted runner
+  # Runner: self-hosted pada VPS peserta
+  #
+  # Prasyarat VPS:
+  #   - Self-hosted runner terdaftar pada repository ini.
+  #   - /opt/agfarm/.env berisi variabel interpolasi Compose:
+  #       DB_DATABASE, DB_USERNAME, DB_PASSWORD, DB_ROOT_PASSWORD
+  #   - /opt/agfarm/app.env berisi environment runtime Laravel.
+  #   - Docker dan Docker Compose v2 sudah terpasang.
+  #   - Repository memiliki akses ke GHCR package Private.
+  # ===========================================================================
+  cd:
+    name: CD — Deploy to VPS
+    needs: ci
+    runs-on: self-hosted
+    concurrency:
+      group: agfarm-deploy-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      # 1. Checkout agar Dockerfile/docker-compose.yml tersedia di workspace runner.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Gunakan tag yang benar-benar dihasilkan job CI.
+      - name: Set deployment variables
+        shell: bash
+        env:
+          IMAGE_TAG_FROM_CI: ${{ needs.ci.outputs.image_tag }}
+        run: |
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_USERNAME=${OWNER}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG_FROM_CI}" >> "$GITHUB_ENV"
+
+      # 3. Pastikan file environment tersedia tanpa menyalinnya ke workspace.
+      - name: Validasi file environment dan Compose
+        shell: bash
+        run: |
+          test -s /opt/agfarm/.env || {
+            echo "File /opt/agfarm/.env tidak ditemukan atau kosong."
+            exit 1
+          }
+          test -s /opt/agfarm/app.env || {
+            echo "File /opt/agfarm/app.env tidak ditemukan atau kosong."
+            exit 1
+          }
+          test -f "$GITHUB_WORKSPACE/docker-compose.yml" || {
+            echo "docker-compose.yml tidak ditemukan di root repository."
+            exit 1
+          }
+          chmod 600 /opt/agfarm/.env /opt/agfarm/app.env
+
+      # 4. Login ke GHCR. GITHUB_TOKEN pada job CD memiliki packages: read.
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Semua perintah Compose menggunakan:
+      # - file Compose dari checkout repository
+      # - /opt/agfarm/.env untuk interpolasi variabel Compose
+      # Service app membaca /opt/agfarm/app.env melalui env_file pada docker-compose.yml.
+
+      # 5. Validasi konfigurasi Compose tanpa menampilkan nilai environment.
+      - name: Validasi konfigurasi Docker Compose
+        run: |
+          docker compose \
+            --env-file /opt/agfarm/.env \
+            -f "$GITHUB_WORKSPACE/docker-compose.yml" \
+            config --quiet
+
+      # 6. Pull image dengan tag SHA yang dibuat oleh job CI.
+      - name: Pull Docker images
+        run: |
+          docker compose \
+            --env-file /opt/agfarm/.env \
+            -f "$GITHUB_WORKSPACE/docker-compose.yml" \
+            pull app nginx
+
+      # 7. Jalankan migration menggunakan image aplikasi yang baru.
+      # Compose akan menjalankan dependency db dan menunggu healthcheck-nya.
+      - name: Jalankan database migration
+        run: |
+          docker compose \
+            --env-file /opt/agfarm/.env \
+            -f "$GITHUB_WORKSPACE/docker-compose.yml" \
+            run --rm app php artisan migrate --force --seed
+
+      # 8. Perbarui app dan nginx. Named volume database tetap dipertahankan.
+      - name: Update container aplikasi
+        run: |
+          docker compose \
+            --env-file /opt/agfarm/.env \
+            -f "$GITHUB_WORKSPACE/docker-compose.yml" \
+            up -d --remove-orphans
+
+      # 9. Periksa status service.
+      - name: Periksa status container
+        run: |
+          docker compose \
+            --env-file /opt/agfarm/.env \
+            -f "$GITHUB_WORKSPACE/docker-compose.yml" \
+            ps
+
+      # 10. Smoke test HTTP melalui loopback host.
+      - name: HTTP smoke test
+        run: |
+          curl --fail --silent --show-error \
+               --retry 10 \
+               --retry-delay 3 \
+               --retry-connrefused \
+               http://127.0.0.1:8080/
